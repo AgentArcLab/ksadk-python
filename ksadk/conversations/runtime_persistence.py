@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from typing import Any, Callable, Mapping, Optional, Sequence, cast
@@ -151,6 +152,7 @@ async def append_conversation_event(
     metadata: Optional[dict[str, Any]] = None,
     event_type: Optional[str] = None,
     content: Optional[dict[str, Any]] = None,
+    event_id: Optional[str] = None,
     session_service_provider: Callable[[], Any] | None = None,
 ) -> SessionEvent:
     """统一的 canonical event 追加入口。
@@ -164,7 +166,7 @@ async def append_conversation_event(
         session_id,
         SessionEvent.from_dict(
             {
-                "id": str(uuid.uuid4()),
+                "id": str(event_id or uuid.uuid4()),
                 "author": author,
                 "event_type": event_type or canonical_event_type(None, author=author, role=role),
                 "invocationId": invocation_id,
@@ -427,6 +429,39 @@ async def append_run_checkpoint_event(
     )
 
 
+def _resume_event_id(
+    session_id: str, run_id: str, checkpoint_id: str, resume_attempt_id: str
+) -> str:
+    """Return the stable physical id for one checkpoint-resume attempt."""
+
+    identity = "\x1f".join((session_id, run_id, checkpoint_id, resume_attempt_id))
+    return "resume_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+def _resume_identity_matches(
+    event: SessionEvent,
+    *,
+    run_id: str,
+    checkpoint_id: str,
+    resume_attempt_id: str,
+    framework: str,
+    framework_ref: Mapping[str, Any],
+) -> None:
+    metadata = event.metadata or {}
+    expected = {
+        "run_id": run_id,
+        "checkpoint_id": checkpoint_id,
+        "resume_attempt_id": resume_attempt_id,
+        "framework": framework,
+        "framework_ref": dict(framework_ref),
+    }
+    actual = {key: metadata.get(key) for key in expected}
+    if actual != expected:
+        raise ValueError(
+            f"resume_attempt_id {resume_attempt_id!r} is already bound to a different checkpoint"
+        )
+
+
 async def append_run_resume_event(
     *,
     session_id: str,
@@ -440,33 +475,83 @@ async def append_run_resume_event(
     metadata: Optional[dict[str, Any]] = None,
     session_service_provider: Callable[[], Any] | None = None,
 ) -> SessionEvent:
+    service = (session_service_provider or resolve_session_service)()
+    run_id = str(run_id).strip()
+    checkpoint_id = str(checkpoint_id).strip()
+    resume_attempt_id = str(resume_attempt_id).strip()
+    framework = str(framework).strip()
+    if not all((session_id.strip(), run_id, checkpoint_id, resume_attempt_id, framework)):
+        raise ValueError(
+            "session_id, run_id, checkpoint_id, resume_attempt_id, and framework are required"
+        )
+    framework_ref_dict = dict(framework_ref)
+
+    # ``resume_attempt_id`` is the caller's idempotency key. Invocation ids
+    # identify a transport execution and may legitimately change on retry.
+    def predicate(event: SessionEvent) -> bool:
+        return (
+            event.event_type == "run_resume"
+            and str((event.metadata or {}).get("resume_attempt_id") or "") == resume_attempt_id
+        )
+
+    existing = await _find_latest_session_event(service, session_id, predicate)
+    if existing is not None:
+        _resume_identity_matches(
+            existing,
+            run_id=run_id,
+            checkpoint_id=checkpoint_id,
+            resume_attempt_id=resume_attempt_id,
+            framework=framework,
+            framework_ref=framework_ref_dict,
+        )
+        return existing
+
     event_metadata = dict(metadata or {})
     event_metadata.update(
         {
-            "run_id": str(run_id),
-            "checkpoint_id": str(checkpoint_id),
-            "resume_attempt_id": str(resume_attempt_id),
-            "framework": str(framework),
-            "framework_ref": dict(framework_ref),
+            "run_id": run_id,
+            "checkpoint_id": checkpoint_id,
+            "resume_attempt_id": resume_attempt_id,
+            "framework": framework,
+            "framework_ref": framework_ref_dict,
         }
     )
-    return await append_conversation_event(
-        session_id=session_id,
-        author=author,
-        role="model",
-        text="checkpoint resume requested",
-        invocation_id=invocation_id,
-        event_type="run_resume",
-        content={
-            "status": "resuming",
-            "run_id": str(run_id),
-            "checkpoint_id": str(checkpoint_id),
-            "resume_attempt_id": str(resume_attempt_id),
-            "framework": str(framework),
-        },
-        metadata=event_metadata,
-        session_service_provider=session_service_provider,
-    )
+    event_id = _resume_event_id(session_id, run_id, checkpoint_id, resume_attempt_id)
+    try:
+        return await append_conversation_event(
+            session_id=session_id,
+            author=author,
+            role="model",
+            text="checkpoint resume requested",
+            invocation_id=invocation_id,
+            event_type="run_resume",
+            event_id=event_id,
+            content={
+                "status": "resuming",
+                "run_id": run_id,
+                "checkpoint_id": checkpoint_id,
+                "resume_attempt_id": resume_attempt_id,
+                "framework": framework,
+            },
+            metadata=event_metadata,
+            session_service_provider=lambda: service,
+        )
+    except Exception:
+        # A concurrent retry can win the deterministic insert. Re-read the
+        # winner and absorb only an identical attempt; unrelated failures stay
+        # visible to the caller.
+        existing = await _find_latest_session_event(service, session_id, predicate)
+        if existing is None:
+            raise
+        _resume_identity_matches(
+            existing,
+            run_id=run_id,
+            checkpoint_id=checkpoint_id,
+            resume_attempt_id=resume_attempt_id,
+            framework=framework,
+            framework_ref=framework_ref_dict,
+        )
+        return existing
 
 
 async def append_reasoning_event(
