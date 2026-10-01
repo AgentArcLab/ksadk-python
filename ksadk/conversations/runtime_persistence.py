@@ -493,7 +493,7 @@ async def append_run_resume_event(
     # identify a transport execution and may legitimately change on retry.
     def predicate(event: SessionEvent) -> bool:
         return (
-            event.event_type == "run_resume"
+            canonical_event_type(event.event_type) == "run_resume"
             and str((event.metadata or {}).get("resume_attempt_id") or "") == resume_attempt_id
         )
 
