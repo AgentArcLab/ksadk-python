@@ -65,3 +65,19 @@ async def test_concurrent_resume_retries_share_one_deterministic_event():
     events = await service.get_events("session-1")
     assert len(events) == 1
     assert events[0].metadata["resume_attempt_id"] == "attempt-1"
+
+
+async def test_concurrent_attempt_reuse_for_different_checkpoint_fails_loudly():
+    service = InMemorySessionService()
+    await service.create_session("agent-1", "user-1", session_id="session-1")
+
+    results = await asyncio.gather(
+        _append(service, invocation_id="invocation-a", checkpoint_id="checkpoint-1"),
+        _append(service, invocation_id="invocation-b", checkpoint_id="checkpoint-2"),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(result, ValueError) for result in results) == 1
+    assert sum(not isinstance(result, BaseException) for result in results) == 1
+    events = await service.get_events("session-1")
+    assert len(events) == 1
