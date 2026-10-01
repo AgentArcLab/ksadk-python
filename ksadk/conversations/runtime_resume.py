@@ -425,6 +425,9 @@ def _tool_receipt_idempotency_key_for_resume(
 def _find_tool_receipt_event_by_key(
     events: Sequence[SessionEvent],
     idempotency_key: str,
+    *,
+    expected_receipt: Mapping[str, Any] | None = None,
+    expected_tool_args: Mapping[str, Any] | None = None,
 ) -> SessionEvent | None:
     for event in reversed(events):
         if event.event_type != "tool_result":
@@ -434,6 +437,22 @@ def _find_tool_receipt_event_by_key(
         if not isinstance(receipt, Mapping):
             continue
         if str(receipt.get("idempotency_key") or "") == idempotency_key:
+            if expected_receipt is not None:
+                for field in ("tool_name", "tool_call_id", "run_id", "checkpoint_id"):
+                    expected = str(expected_receipt.get(field) or "")
+                    actual = str(receipt.get(field) or "")
+                    if expected != actual:
+                        raise ValueError(
+                            f"tool receipt idempotency collision: {field} does not match"
+                        )
+                if expected_tool_args is not None:
+                    actual_args = metadata.get("tool_args")
+                    if not isinstance(actual_args, Mapping) or dict(actual_args) != dict(
+                        expected_tool_args
+                    ):
+                        raise ValueError(
+                            "tool receipt idempotency collision: tool_args do not match"
+                        )
             return event
     return None
 
@@ -475,10 +494,6 @@ async def _execute_approved_builtin_tool_resume(
     if not isinstance(approval, Mapping) or not bool(approval.get("approved")):
         return None
     tool_name = str(resume_input.get("tool_name") or "").strip()
-    tool_func = _builtin_tool_callable(tool_name)
-    if tool_func is None:
-        return None
-
     tool_args = resume_input.get("tool_args")
     if not isinstance(tool_args, Mapping):
         return None
@@ -511,7 +526,29 @@ async def _execute_approved_builtin_tool_resume(
     existing_event = _find_tool_receipt_event_by_key(
         existing_events,
         receipt["idempotency_key"],
+        expected_receipt=receipt,
+        expected_tool_args=call_args,
     )
+    legacy_receipt_fallback = False
+    if existing_event is None and requested_checkpoint_id:
+        # Receipts written before checkpoint-scoped keys used the same
+        # session/run/tool/args key with an empty checkpoint field. Reuse that
+        # immutable ledger entry once, but keep strict identity validation for
+        # every field that legacy rows carry.
+        legacy_receipt = _tool_receipt_metadata(
+            session_id=session_id,
+            run_id=run_id,
+            tool_name=tool_name,
+            tool_args=call_args,
+            tool_call_id=run_id,
+        )
+        existing_event = _find_tool_receipt_event_by_key(
+            existing_events,
+            legacy_receipt["idempotency_key"],
+            expected_receipt=legacy_receipt,
+            expected_tool_args=call_args,
+        )
+        legacy_receipt_fallback = existing_event is not None
     if existing_event is not None:
         existing_metadata = existing_event.metadata or {}
         output = existing_metadata.get("tool_output", "")
@@ -522,6 +559,8 @@ async def _execute_approved_builtin_tool_resume(
             "replayed": True,
             "replayed_from_event_id": existing_event.id,
         }
+        if legacy_receipt_fallback:
+            replayed_receipt["legacy_key_fallback"] = True
         await append_conversation_event(
             session_id=session_id,
             author="tool",
@@ -546,6 +585,10 @@ async def _execute_approved_builtin_tool_resume(
             "call_id": run_id,
             "output": output,
         }
+
+    tool_func = _builtin_tool_callable(tool_name)
+    if tool_func is None:
+        return None
 
     try:
         if tool_name in {"run_command", "run_code"}:
