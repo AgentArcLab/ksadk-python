@@ -507,6 +507,37 @@ def _resume_event_identity(
     return run_id, checkpoint_id, resume_attempt_id, framework or None, None
 
 
+async def find_resume_attempt_event(
+    service: Any,
+    session_id: str,
+    *,
+    resume_attempt_id: str,
+    run_id: str | None = None,
+    checkpoint_id: str | None = None,
+) -> SessionEvent | None:
+    """Find a prior legacy or canonical resume fact for idempotent API retries."""
+
+    attempt_id = str(resume_attempt_id).strip()
+    if not attempt_id:
+        return None
+
+    def predicate(event: SessionEvent) -> bool:
+        identity = _resume_event_identity(event)
+        if identity is None or identity[2] != attempt_id:
+            return False
+        if run_id is not None and identity[0] != str(run_id).strip():
+            raise ValueError(
+                f"resume_attempt_id {attempt_id!r} is already bound to a different run"
+            )
+        if checkpoint_id is not None and identity[1] != str(checkpoint_id).strip():
+            raise ValueError(
+                f"resume_attempt_id {attempt_id!r} is already bound to a different checkpoint"
+            )
+        return True
+
+    return await _find_latest_session_event(service, session_id, predicate)
+
+
 async def append_run_resume_event(
     *,
     session_id: str,
@@ -533,13 +564,13 @@ async def append_run_resume_event(
 
     # ``resume_attempt_id`` is the caller's idempotency key. Invocation ids
     # identify a transport execution and may legitimately change on retry.
-    def predicate(event: SessionEvent) -> bool:
-        return (
-            (identity := _resume_event_identity(event)) is not None
-            and identity[2] == resume_attempt_id
-        )
-
-    existing = await _find_latest_session_event(service, session_id, predicate)
+    existing = await find_resume_attempt_event(
+        service,
+        session_id,
+        resume_attempt_id=resume_attempt_id,
+        run_id=run_id,
+        checkpoint_id=checkpoint_id,
+    )
     if existing is not None:
         _resume_identity_matches(
             existing,
@@ -585,7 +616,13 @@ async def append_run_resume_event(
         # A concurrent retry can win the deterministic insert. Re-read the
         # winner and absorb only an identical attempt; unrelated failures stay
         # visible to the caller.
-        existing = await _find_latest_session_event(service, session_id, predicate)
+        existing = await find_resume_attempt_event(
+            service,
+            session_id,
+            resume_attempt_id=resume_attempt_id,
+            run_id=run_id,
+            checkpoint_id=checkpoint_id,
+        )
         if existing is None:
             raise
         _resume_identity_matches(
