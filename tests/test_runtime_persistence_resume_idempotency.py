@@ -8,6 +8,8 @@ from ksadk.conversations.runtime_persistence import (
     append_conversation_event,
     append_run_resume_event,
 )
+from ksadk.events.canonical import ContinuationResumed, SourceRef
+from ksadk.events.canonical_store import runtime_event_to_session_event
 from ksadk.sessions.in_memory import InMemorySessionService
 from ksadk.sessions.local_service import LocalSessionService
 
@@ -85,6 +87,32 @@ async def test_resume_attempt_reuses_supported_legacy_event_alias():
     result = await _append(service, invocation_id="invocation-a")
 
     assert result.invocation_id == "legacy-invocation"
+    assert len(await service.get_events("session-1")) == 1
+
+
+async def test_resume_attempt_reuses_canonical_continuation_event():
+    service = InMemorySessionService()
+    await service.create_session("agent-1", "user-1", session_id="session-1")
+    canonical = ContinuationResumed(
+        schema_version=2,
+        event_id="canonical-resume-1",
+        seq=0,
+        timestamp=1.0,
+        run_id="run-1",
+        run_seq=1,
+        scope_id="run:run-1",
+        source=SourceRef(framework="langgraph"),
+        continuation_id="checkpoint-1",
+        continuation_kind="graph_checkpoint",
+        resume_attempt_id="attempt-1",
+    )
+    await service.append_event(
+        "session-1", runtime_event_to_session_event("session-1", canonical)
+    )
+
+    result = await _append(service, invocation_id="invocation-a")
+
+    assert result.event_type == "continuation.resumed"
     assert len(await service.get_events("session-1")) == 1
 
 
