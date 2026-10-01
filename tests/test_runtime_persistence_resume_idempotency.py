@@ -4,7 +4,10 @@ import asyncio
 
 import pytest
 
-from ksadk.conversations.runtime_persistence import append_run_resume_event
+from ksadk.conversations.runtime_persistence import (
+    append_conversation_event,
+    append_run_resume_event,
+)
 from ksadk.sessions.in_memory import InMemorySessionService
 from ksadk.sessions.local_service import LocalSessionService
 
@@ -50,6 +53,39 @@ async def test_resume_attempt_collision_fails_loudly(tmp_path):
 
     with pytest.raises(ValueError, match="already bound to a different checkpoint"):
         await _append(service, invocation_id="invocation-b", checkpoint_id="checkpoint-2")
+
+
+async def test_resume_attempt_reuses_supported_legacy_event_alias():
+    service = InMemorySessionService()
+    await service.create_session("agent-1", "user-1", session_id="session-1")
+    await append_conversation_event(
+        session_id="session-1",
+        author="agent-1",
+        role="model",
+        text="checkpoint resume requested",
+        invocation_id="legacy-invocation",
+        event_type="runtime_resume",
+        content={
+            "status": "resuming",
+            "run_id": "run-1",
+            "checkpoint_id": "checkpoint-1",
+            "resume_attempt_id": "attempt-1",
+            "framework": "langgraph",
+        },
+        metadata={
+            "run_id": "run-1",
+            "checkpoint_id": "checkpoint-1",
+            "resume_attempt_id": "attempt-1",
+            "framework": "langgraph",
+            "framework_ref": {"langgraph": {"checkpoint_id": "checkpoint-1"}},
+        },
+        session_service_provider=lambda: service,
+    )
+
+    result = await _append(service, invocation_id="invocation-a")
+
+    assert result.invocation_id == "legacy-invocation"
+    assert len(await service.get_events("session-1")) == 1
 
 
 async def test_concurrent_resume_retries_share_one_deterministic_event():
