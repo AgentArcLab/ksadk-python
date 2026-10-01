@@ -15,6 +15,7 @@ from ksadk.conversations.run_kinds import (
     validate_run_mode,
 )
 from ksadk.conversations.runtime_persistence import append_conversation_event
+from ksadk.conversations.tool_receipts import _validate_tool_receipt_event
 from ksadk.events.v1_compat import EventTypeV1 as EventType
 from ksadk.sessions import SessionEvent
 from ksadk.tools.gateway import (
@@ -593,7 +594,8 @@ async def _execute_approved_builtin_tool_resume(
             raise LegacyToolReceiptCheckpointAmbiguityError()
     if existing_event is not None:
         existing_metadata = existing_event.metadata or {}
-        output = existing_metadata.get("tool_output", "")
+        _validate_tool_receipt_event(existing_event)
+        output = existing_metadata["tool_output"]
         if isinstance(output, Mapping):
             output = {**dict(output), "replayed": True}
         replayed_receipt = {
