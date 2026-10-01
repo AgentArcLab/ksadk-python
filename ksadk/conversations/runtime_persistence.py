@@ -430,11 +430,14 @@ async def append_run_checkpoint_event(
 
 
 def _resume_event_id(
-    session_id: str, run_id: str, checkpoint_id: str, resume_attempt_id: str
+    session_id: str, resume_attempt_id: str
 ) -> str:
-    """Return the stable physical id for one checkpoint-resume attempt."""
+    """Return the stable physical id for one session-scoped resume attempt."""
 
-    identity = "\x1f".join((session_id, run_id, checkpoint_id, resume_attempt_id))
+    # The attempt id is the semantic idempotency key. Keep the physical key
+    # independent of checkpoint details so a concurrent reuse of an attempt
+    # cannot create two rows before the collision validator runs.
+    identity = "\x1f".join((session_id, resume_attempt_id))
     return "resume_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
 
@@ -516,7 +519,7 @@ async def append_run_resume_event(
             "framework_ref": framework_ref_dict,
         }
     )
-    event_id = _resume_event_id(session_id, run_id, checkpoint_id, resume_attempt_id)
+    event_id = _resume_event_id(session_id, resume_attempt_id)
     try:
         return await append_conversation_event(
             session_id=session_id,
