@@ -17,7 +17,9 @@ from ksadk.sessions._postgres_tables import (
     KSADK_PG_EVENTS_TABLE,
     KSADK_PG_SESSIONS_TABLE,
     KSADK_PG_STATES_TABLE,
+    pg_tool_receipts_table,
 )
+from ksadk.sessions._postgres_tool_receipts import _PostgresToolReceiptMixin
 from ksadk.sessions.base import (
     CANONICAL_EVENT_STORAGE_CAPABILITIES,
     BaseSessionService,
@@ -35,7 +37,7 @@ from ksadk.sessions.errors import SessionBackendUnavailable
 logger = logging.getLogger(__name__)
 
 
-class PostgresSessionService(_PostgresSchemaMixin, BaseSessionService):
+class PostgresSessionService(_PostgresToolReceiptMixin, _PostgresSchemaMixin, BaseSessionService):
     storage_capabilities = CANONICAL_EVENT_STORAGE_CAPABILITIES
 
     def __init__(
@@ -198,6 +200,13 @@ class PostgresSessionService(_PostgresSchemaMixin, BaseSessionService):
         await self._ensure_schema()
         async with self._pool.acquire() as connection:
             async with connection.transaction():
+                if await connection.fetchval(
+                    f"SELECT 1 FROM {pg_tool_receipts_table} "
+                    "WHERE namespace=$1 AND session_id=$2 AND state='unknown' LIMIT 1",
+                    self.namespace,
+                    session_id,
+                ):
+                    raise ValueError("session has durable tool receipt claims")
                 await connection.execute(
                     f"""
                     DELETE FROM {KSADK_PG_STATES_TABLE}
@@ -1185,7 +1194,6 @@ class PostgresSessionService(_PostgresSchemaMixin, BaseSessionService):
         if isinstance(value, str):
             return dict(json.loads(value or "{}"))
         return dict(value)
-
 
 def create_postgres_session_service(
     *,

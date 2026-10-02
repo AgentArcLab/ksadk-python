@@ -16,7 +16,9 @@ from ksadk.sessions._local_tables import (
     KSADK_EVENTS_TABLE,
     KSADK_SESSIONS_TABLE,
     KSADK_STATES_TABLE,
+    tool_receipts_table,
 )
+from ksadk.sessions._tool_receipt_sync import _LocalToolReceiptMixin
 from ksadk.sessions.base import (
     CheckpointEventQuery,
     Session,
@@ -29,7 +31,7 @@ from ksadk.sessions.base import (
 )
 
 
-class _LocalServiceSyncMixin:
+class _LocalServiceSyncMixin(_LocalToolReceiptMixin):
     @staticmethod
     def _event_from_query_row(row) -> SessionEvent:
         return SessionEvent(
@@ -467,6 +469,12 @@ class _LocalServiceSyncMixin:
             ).fetchone()
             if row is None:
                 return False
+            if connection.execute(
+                f"SELECT 1 FROM {tool_receipts_table} "
+                "WHERE session_id = ? AND state = 'unknown' LIMIT 1",
+                (session_id,),
+            ).fetchone():
+                raise ValueError("session has durable tool receipt claims")
 
             connection.execute(
                 f"DELETE FROM {KSADK_EVENTS_TABLE} WHERE session_id = ?", (session_id,)
